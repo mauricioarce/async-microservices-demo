@@ -1,46 +1,81 @@
 const express = require('express');
 const http = require('http');
 const bodyParser = require('body-parser');
+const mysql = require('mysql');
 const amqp = require('amqplib');
+
 const app = express();
 
-// Middleware
+const dbConnString = `${process.env.DATABASE_URL || 'localhost'}`;
+const amqpConnString = `amqp://${process.env.RABBITMQ_URL || 'localhost'}`;
+
+const dbConnection = mysql.createConnection({
+  host: dbConnString,
+  user: 'pokeuser',
+  password: '123',
+  database: 'pokemondb'
+});
+
+let lastRequestId = 1;
+let amqpConnection;
+let mainChannel;
+
 app.use(bodyParser.json());
 
-// simulate request ids
-let lastRequestId = 1;
+app.get('/api/v1/pokemon', async function(req, res) {
+  dbConnection.query('SELECT * FROM pokemon', function(err, result) {
+    if (err) {
+      res.status(500).send(err);
+    } else {
+      res.status(200).send(result);
+    }
+  });
+});
 
-// RabbitMQ connection string
-const messageQueueConnectionString = `amqp://${process.env.RABBITMQ_URL ||
-  'localhost'}`;
+app.get('/api/v1/pokemon/:pokenumber', async function(req, res) {
+  const pokenumber = req.params.pokenumber;
 
-// handle the request
+  dbConnection.query(
+    `SELECT * FROM pokemon WHERE pokenumber = ${pokenumber} ORDER BY pokenumber LIMIT 1`,
+    function(err, result) {
+      if (err) {
+        res.status(500).send(err);
+      } else {
+        let requestData = result[0];
+        let requestId = requestData.pokenumber;
+        console.log('Published a request message, requestId:', requestId);
+        publishToChannel({
+          routingKey: 'request',
+          exchangeName: 'processing',
+          data: { requestId, requestData }
+        });
+        res.status(200).send(requestData);
+      }
+    }
+  );
+});
+
 app.post('/api/v1/processData', async function(req, res) {
-  // save request id and increment
   let requestId = lastRequestId;
   lastRequestId++;
 
-  // connect to Rabbit MQ and create a channel
-  let connection = await amqp.connect(messageQueueConnectionString);
-  let channel = await connection.createConfirmChannel();
-
-  // publish the data to Rabbit MQ
+  amqpConnection = await amqp.connect(amqpConnString);
+  mainChannel = await amqpConnection.createConfirmChannel();
   let requestData = req.body.data;
+
   console.log('Published a request message, requestId:', requestId);
-  await publishToChannel(channel, {
+  await publishToChannel({
     routingKey: 'request',
     exchangeName: 'processing',
     data: { requestId, requestData }
   });
 
-  // send the request id in the response
-  res.send({ requestId });
+  res.status(200).send({ requestId });
 });
 
-// utility function to publish messages to a channel
-function publishToChannel(channel, { routingKey, exchangeName, data }) {
+function publishToChannel({ routingKey, exchangeName, data }) {
   return new Promise((resolve, reject) => {
-    channel.publish(
+    mainChannel.publish(
       exchangeName,
       routingKey,
       Buffer.from(JSON.stringify(data), 'utf-8'),
@@ -56,40 +91,39 @@ function publishToChannel(channel, { routingKey, exchangeName, data }) {
   });
 }
 
-async function setupExchangesAndQueues(channel) {
+async function setupExchangesAndQueues() {
   console.log('Setting up RabbitMQ Exchanges/Queues');
-  // create exchange
-  await channel.assertExchange('processing', 'direct', { durable: true });
-
-  // create queues
-  await channel.assertQueue('processing.requests', { durable: true });
-  await channel.assertQueue('processing.results', { durable: true });
-
-  // bind queues
-  await channel.bindQueue('processing.requests', 'processing', 'request');
-  await channel.bindQueue('processing.results', 'processing', 'result');
-
+  await mainChannel.assertExchange('processing', 'direct', { durable: true });
+  await mainChannel.assertQueue('processing.requests', { durable: true });
+  await mainChannel.assertQueue('processing.results', { durable: true });
+  await mainChannel.bindQueue('processing.requests', 'processing', 'request');
+  await mainChannel.bindQueue('processing.results', 'processing', 'result');
   console.log('Setup DONE');
 }
 
 async function listenForResults() {
-  // connect to Rabbit MQ
-  let connection = await amqp.connect(messageQueueConnectionString);
+  amqpConnection = await amqp.connect(amqpConnString);
+  mainChannel = await amqpConnection.createChannel();
 
-  // create a channel and prefetch 1 message at a time
-  let channel = await connection.createChannel();
-  await setupExchangesAndQueues(channel);
-  await channel.prefetch(1);
-
-  // start consuming messages
-  await consume({ connection, channel });
+  await setupExchangesAndQueues(mainChannel);
+  await mainChannel.prefetch(1);
+  await consume({ mainChannel });
 }
 
-// consume messages from RabbitMQ
-function consume({ connection, channel, resultsChannel }) {
+async function init() {
+  await dbConnection.connect(function(err) {
+    if (err) {
+      throw err;
+    }
+
+    console.log('Connected to DB!');
+  });
+  listenForResults();
+}
+
+function consume({ mainChannel }) {
   return new Promise((resolve, reject) => {
-    channel.consume('processing.results', async function(msg) {
-      // parse message
+    mainChannel.consume('processing.results', async function(msg) {
       let msgBody = msg.content.toString();
       let data = JSON.parse(msgBody);
       let requestId = data.requestId;
@@ -101,23 +135,19 @@ function consume({ connection, channel, resultsChannel }) {
         processingResults
       );
 
-      // acknowledge message as received
-      await channel.ack(msg);
+      await mainChannel.ack(msg);
     });
 
-    // handle connection closed
-    connection.on('close', err => {
+    amqpConnection.on('close', err => {
       return reject(err);
     });
 
-    // handle errors
-    connection.on('error', err => {
+    amqpConnection.on('error', err => {
       return reject(err);
     });
   });
 }
 
-// Start the server
 const PORT = 3000;
 server = http.createServer(app);
 server.listen(PORT, function(err) {
@@ -128,5 +158,4 @@ server.listen(PORT, function(err) {
   }
 });
 
-// listen for results on RabbitMQ
-listenForResults();
+init();
