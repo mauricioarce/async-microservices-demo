@@ -1,104 +1,161 @@
-const path  = require('path');
-require('dotenv').config({path:  path.resolve(process.cwd(), '../.env')});
-
 const express = require('express');
-const app = express();
 const http = require('http');
 const bodyParser = require('body-parser');
+const mysql = require('mysql');
 const amqp = require('amqplib');
 
-// Middleware
+const app = express();
+
+const dbConnString = `${process.env.DATABASE_URL || 'localhost'}`;
+const amqpConnString = `amqp://${process.env.RABBITMQ_URL || 'localhost'}`;
+
+const dbConnection = mysql.createConnection({
+  host: dbConnString,
+  user: 'pokeuser',
+  password: '123',
+  database: 'pokemondb'
+});
+
+let lastRequestId = 1;
+let amqpConnection;
+let mainChannel;
+
 app.use(bodyParser.json());
 
-// simulate request ids
-let lastRequestId = 1;
+app.get('/api/v1/pokemon', async function(req, res) {
+  dbConnection.query('SELECT * FROM pokemon', function(err, result) {
+    if (err) {
+      res.status(500).send(err);
+    } else {
+      res.status(200).send(result);
+    }
+  });
+});
 
-// RabbitMQ connection string
-const messageQueueConnectionString = process.env.CLOUDAMQP_URL;
+app.get('/api/v1/pokemon/:pokenumber', async function(req, res) {
+  const pokenumber = req.params.pokenumber;
 
-// handle the request
-app.post('/api/v1/processData', async function (req, res) {
-  // save request id and increment
+  dbConnection.query(
+    `SELECT * FROM pokemon WHERE pokenumber = ${pokenumber} ORDER BY pokenumber LIMIT 1`,
+    function(err, result) {
+      if (err) {
+        res.status(500).send(err);
+      } else {
+        let requestData = result[0];
+        let requestId = requestData.pokenumber;
+        console.log('Published a request message, requestId:', requestId);
+        publishToChannel({
+          routingKey: 'request',
+          exchangeName: 'processing',
+          data: { requestId, requestData }
+        });
+        res.status(200).send(requestData);
+      }
+    }
+  );
+});
+
+app.post('/api/v1/processData', async function(req, res) {
   let requestId = lastRequestId;
   lastRequestId++;
 
-  // connect to Rabbit MQ and create a channel
-  let connection = await amqp.connect(messageQueueConnectionString);
-  let channel = await connection.createConfirmChannel();
-
-  // publish the data to Rabbit MQ
+  amqpConnection = await amqp.connect(amqpConnString);
+  mainChannel = await amqpConnection.createConfirmChannel();
   let requestData = req.body.data;
-  console.log("Published a request message, requestId:", requestId);
-  await publishToChannel(channel, { routingKey: "request", exchangeName: "processing", data: { requestId, requestData } });
 
-  // send the request id in the response
-  res.send({ requestId })
+  console.log('Published a request message, requestId:', requestId);
+  await publishToChannel({
+    routingKey: 'request',
+    exchangeName: 'processing',
+    data: { requestId, requestData }
+  });
+
+  res.status(200).send({ requestId });
 });
 
-// utility function to publish messages to a channel
-function publishToChannel(channel, { routingKey, exchangeName, data }) {
+function publishToChannel({ routingKey, exchangeName, data }) {
   return new Promise((resolve, reject) => {
-    channel.publish(exchangeName, routingKey, Buffer.from(JSON.stringify(data), 'utf-8'), { persistent: true }, function (err, ok) {
-      if (err) {
-        return reject(err);
-      }
+    mainChannel.publish(
+      exchangeName,
+      routingKey,
+      Buffer.from(JSON.stringify(data), 'utf-8'),
+      { persistent: true },
+      function(err, ok) {
+        if (err) {
+          return reject(err);
+        }
 
-      resolve();
-    })
+        resolve();
+      }
+    );
   });
 }
 
-
-async function listenForResults() {
-  // connect to Rabbit MQ
-  let connection = await amqp.connect(messageQueueConnectionString);
-
-  // create a channel and prefetch 1 message at a time
-  let channel = await connection.createChannel();
-  await channel.prefetch(1);
-
-  // start consuming messages
-  await consume({ connection, channel });
+async function setupExchangesAndQueues() {
+  console.log('Setting up RabbitMQ Exchanges/Queues');
+  await mainChannel.assertExchange('processing', 'direct', { durable: true });
+  await mainChannel.assertQueue('processing.requests', { durable: true });
+  await mainChannel.assertQueue('processing.results', { durable: true });
+  await mainChannel.bindQueue('processing.requests', 'processing', 'request');
+  await mainChannel.bindQueue('processing.results', 'processing', 'result');
+  console.log('Setup DONE');
 }
 
+async function listenForResults() {
+  amqpConnection = await amqp.connect(amqpConnString);
+  mainChannel = await amqpConnection.createChannel();
 
-// consume messages from RabbitMQ
-function consume({ connection, channel, resultsChannel }) {
+  await setupExchangesAndQueues(mainChannel);
+  await mainChannel.prefetch(1);
+  await consume({ mainChannel });
+}
+
+async function init() {
+  await dbConnection.connect(function(err) {
+    if (err) {
+      throw err;
+    }
+
+    console.log('Connected to DB!');
+  });
+  listenForResults();
+}
+
+function consume({ mainChannel }) {
   return new Promise((resolve, reject) => {
-    channel.consume("processing.results", async function (msg) {
-      // parse message
+    mainChannel.consume('processing.results', async function(msg) {
       let msgBody = msg.content.toString();
       let data = JSON.parse(msgBody);
       let requestId = data.requestId;
       let processingResults = data.processingResults;
-      console.log("Received a result message, requestId:", requestId, "processingResults:", processingResults);
+      console.log(
+        'Received a result message, requestId:',
+        requestId,
+        'processingResults:',
+        processingResults
+      );
 
-      // acknowledge message as received
-      await channel.ack(msg);
+      await mainChannel.ack(msg);
     });
 
-    // handle connection closed
-    connection.on("close", (err) => {
+    amqpConnection.on('close', err => {
       return reject(err);
     });
 
-    // handle errors
-    connection.on("error", (err) => {
+    amqpConnection.on('error', err => {
       return reject(err);
     });
   });
 }
 
-// Start the server
 const PORT = 3000;
 server = http.createServer(app);
-server.listen(PORT, "localhost", function (err) {
+server.listen(PORT, function(err) {
   if (err) {
     console.error(err);
   } else {
-    console.info("Listening on port %s.", PORT);
+    console.info('Listening on port %s.', PORT);
   }
 });
 
-// listen for results on RabbitMQ
-listenForResults();
+init();

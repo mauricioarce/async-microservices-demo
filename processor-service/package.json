@@ -1,0 +1,14 @@
+{
+  "name": "async-microservices-demo",
+  "version": "1.0.0",
+  "description": "",
+  "main": "rabbit-mq-setup.js",
+  "scripts": {
+    "setup": "node ./rabbit-mq-setup.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "amqplib": "^0.5.3"
+  }
+}
