@@ -1,0 +1,36 @@
+version: '3'
+
+services:
+  my-rabbitmq:
+    build: ./rabbitmq-service
+    ports:
+      - '5672:5672'
+    hostname: my-rabbitmq
+    networks:
+      - demo-network
+
+  processor-service:
+    build: ./processor-service
+    depends_on:
+      - my-rabbitmq
+    environment:
+      - WAIT_HOSTS=my-rabbitmq:5672
+      - RABBITMQ_URL=my-rabbitmq
+    networks:
+      - demo-network
+
+  web-service:
+    build: ./web-service
+    ports:
+      - '3000:3000'
+    depends_on:
+      - my-rabbitmq
+    environment:
+      - WAIT_HOSTS=my-rabbitmq:5672
+      - RABBITMQ_URL=my-rabbitmq
+    networks:
+      - demo-network
+
+networks:
+  demo-network:
+    driver: 'bridge'

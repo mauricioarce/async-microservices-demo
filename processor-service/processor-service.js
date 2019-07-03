@@ -1,10 +1,24 @@
-const path  = require('path');
-require('dotenv').config({path:  path.resolve(process.cwd(), '../.env')});
-
 const amqp = require('amqplib');
 
 // RabbitMQ connection string
-const messageQueueConnectionString = process.env.CLOUDAMQP_URL;
+const messageQueueConnectionString = `amqp://${process.env.RABBITMQ_URL ||
+  'localhost'}`;
+
+async function setupExchangesAndQueues(channel) {
+  console.log('Setting up RabbitMQ Exchanges/Queues');
+  // create exchange
+  await channel.assertExchange('processing', 'direct', { durable: true });
+
+  // create queues
+  await channel.assertQueue('processing.requests', { durable: true });
+  await channel.assertQueue('processing.results', { durable: true });
+
+  // bind queues
+  await channel.bindQueue('processing.requests', 'processing', 'request');
+  await channel.bindQueue('processing.results', 'processing', 'result');
+
+  console.log('Setup DONE');
+}
 
 async function listenForMessages() {
   // connect to Rabbit MQ
@@ -12,6 +26,7 @@ async function listenForMessages() {
 
   // create a channel and prefetch 1 message at a time
   let channel = await connection.createChannel();
+  await setupExchangesAndQueues(channel);
   await channel.prefetch(1);
 
   // create a second channel to send back the results
@@ -24,49 +39,55 @@ async function listenForMessages() {
 // utility function to publish messages to a channel
 function publishToChannel(channel, { routingKey, exchangeName, data }) {
   return new Promise((resolve, reject) => {
-    channel.publish(exchangeName, routingKey, Buffer.from(JSON.stringify(data), 'utf-8'), { persistent: true }, function (err, ok) {
-      if (err) {
-        return reject(err);
-      }
+    channel.publish(
+      exchangeName,
+      routingKey,
+      Buffer.from(JSON.stringify(data), 'utf-8'),
+      { persistent: true },
+      function(err, ok) {
+        if (err) {
+          return reject(err);
+        }
 
-      resolve();
-    })
+        resolve();
+      }
+    );
   });
 }
 
 // consume messages from RabbitMQ
 function consume({ connection, channel, resultsChannel }) {
   return new Promise((resolve, reject) => {
-    channel.consume("processing.requests", async function (msg) {
+    channel.consume('processing.requests', async function(msg) {
       // parse message
       let msgBody = msg.content.toString();
       let data = JSON.parse(msgBody);
       let requestId = data.requestId;
       let requestData = data.requestData;
-      console.log("Received a request message, requestId:", requestId);
+      console.log('Received a request message, requestId:', requestId);
 
       // process data
       let processingResults = await processMessage(requestData);
 
       // publish results to channel
       await publishToChannel(resultsChannel, {
-        exchangeName: "processing",
-        routingKey: "result",
+        exchangeName: 'processing',
+        routingKey: 'result',
         data: { requestId, processingResults }
       });
-      console.log("Published results for requestId:", requestId);
+      console.log('Published results for requestId:', requestId);
 
       // acknowledge message as processed successfully
       await channel.ack(msg);
     });
 
     // handle connection closed
-    connection.on("close", (err) => {
+    connection.on('close', err => {
       return reject(err);
     });
 
     // handle errors
-    connection.on("error", (err) => {
+    connection.on('error', err => {
       return reject(err);
     });
   });
@@ -76,7 +97,7 @@ function consume({ connection, channel, resultsChannel }) {
 function processMessage(requestData) {
   return new Promise((resolve, reject) => {
     setTimeout(() => {
-      resolve(requestData + "-processed")
+      resolve(requestData + '-processed');
     }, 5000);
   });
 }
