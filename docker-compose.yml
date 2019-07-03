@@ -5,6 +5,7 @@ services:
     build: ./rabbitmq-service
     ports:
       - '5672:5672'
+      - '15672:15672'
     hostname: my-rabbitmq
     networks:
       - demo-network
